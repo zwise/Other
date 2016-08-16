@@ -150,8 +150,7 @@ def optionsPage() {
         section("Select ceiling fan operating mode desired (default to 'YES-Auto'..."){
 			input "autoMode", "enum", title: "Enable Ceiling Fan Thermostat?", options: ["NO-Manual","YES-Auto"], required: false
 		}
-    	section ("Change SmartApp name, Mode selector") {
-		label title: "Assign a name", required: false
+    	section ("Mode selector") {
 		mode title: "Set for specific mode(s)", required: false
 		}
    
