@@ -149,15 +149,15 @@ def optionsPage() {
 		}
 		if (motionSensor) {
 			section("Turn off ceiling fan thermostat when there's been no motion detected for..."){
-				input "minutesNoMotion", "number", title: "Minutes?", required: true
+				input "motionInactivityTimeout", "number", title: "Minutes?", required: true
 			}
 		}
 		section("Select ceiling fan operating mode desired (default to 'YES-Auto'..."){
 			input "autoMode", "enum", title: "Enable Ceiling Fan Thermostat?", options: ["NO-Manual","YES-Auto"], required: false
 		}
 		section("Override app if fan speed changed from switch"){
-			input(name: "overrideFromSwitch", title: "Override from switch?", type: "bool", required: true, defaultValue: false, description: "Allows temporary overriding of the app processing if the fan is controlled from the switch.")
-			input(name: "overrideFromSwitchTime", title: "Override time (minutes)", type: "number", required: false, description: "How long should the app stop processing?")
+			input(name: "override", title: "Override from switch?", type: "bool", required: true, defaultValue: false, description: "Allows temporary overriding of the app processing if the fan is controlled from the switch.")
+			input(name: "overrideTimeout", title: "Override time (minutes)", type: "number", required: false, description: "How long should the app stop processing?")
 		}
 		section ("Mode selector") {
 			mode title: "Set for specific mode(s)", required: false
@@ -205,10 +205,12 @@ def initParent() {
 def initChild() {
 	if (state.debug) log.debug "def INITIALIZE with settings: ${settings}"
 	subscribe(tempSensor, "temperature", temperatureHandler) //call temperatureHandler method when any reported change to "temperature" attribute
+	runEvery5Minutes(handleTemperature, [data: tempSensor.currentTemperature])
 	if (motionSensor) {
 		subscribe(motionSensor, "motion", motionHandler) //call the motionHandler method when there is any reported change to the "motion" attribute
+		state.hasRecentMotion = true
 	}
-	if (overrideFromSwitch) {
+	if (override) {
 		subscribe(fanDimmer, "switch", fanLevelChangedHandler)
 		subscribe(fanDimmer, "level", fanLevelChangedHandler)
 		subscribeToCommand(fanDimmer, "lowSpeed", fanLevelChangedHandler)
@@ -216,47 +218,52 @@ def initChild() {
 		subscribeToCommand(fanDimmer, "highSpeed", fanLevelChangedHandler)
 		state.lastAutoLevelSetTime = 0 // record the last time the app set the fan level
 		state.lastSwitchLevelSetTime = 0 // record te timestamp of the last level change at the switch (regardless of source)
+		state.hasRecentOverride = false
 	}
 }
 
 //Event Handler Methods
 def fanLevelChangedHandler(evt) {
 	state.lastSwitchLevelSetTime = evt.date.getTime()
+	if (wasOverride()) {
+		runIn(overrideTimeout * 60, recentOverride)
+	}
 	if (state.debug) log.debug "fanLevelChangedHandler called at $state.lastSwitchLevelSetTime"
 }
 
-def temperatureHandler(evt) {
-	if (state.debug) log.debug "temperatureHandler called: $evt" 
+def temperatureHandler(evt) { 
 	handleTemperature(evt.doubleValue)
 	if (state.debug) log.debug "temperatureHandler evt.doubleValue : $evt"
 }
 
-def handleTemperature(temp) {   //
-	if (state.debug) log.debug "handleTemperature called: $evt"  
-	def isActive = hasBeenRecentMotion()
-	if (isActive) {
-		//motion detected recently
-		tempCheck(temp, setpoint)
-		if (state.debug) log.debug "handleTemperature ISACTIVE($isActive)"
+def handleTemperature(temp) {   // 
+	if (motion && !state.hasRecentMotion) {
+		fanDimmer.off()
 	}
 	else {
-			fanDimmer.off()
+		if (state.debug) log.debug "handler running: $temp"
+		//motion detected recently
+		tempCheck(temp, setpoint)
 	}
 }
 
 def motionHandler(evt) {
 	if (evt.value == "active") {
 		//motion detected
+		if(motionInactivityTimeout) {
+			// reset the clock for no motion counter
+			if (state.debug) log.debug "motion was detected; resetting noMotion timer"
+			state.hasRecentMotion = true
+			runIn(motionInactivityTimeout * 60, recentMotion)
+		}
 		def lastTemp = tempSensor.currentTemperature
-		if (state.debug) log.debug "motionHandler ACTIVE($isActive)"
 		if (lastTemp != null) {
 			tempCheck(lastTemp, setpoint)
 		}
 	} else if (evt.value == "inactive") {   //testing to see if evt.value is indeed equal to "inactive" (vs evt.value to "active")
 		//motion stopped
-		def isActive = hasBeenRecentMotion()  //define isActive local variable to returned true or false
-		if (state.debug) log.debug "motionHandler INACTIVE($isActive)"
-		if (isActive) {
+		if (state.debug) log.debug "motion sensor claimed to be inactive"
+		if (state.hasRecentMotion) {
 			def lastTemp = tempSensor.currentTemperature
 			if (lastTemp != null) {       //lastTemp not equal to null (value never been set) 
 				tempCheck(lastTemp, setpoint)
@@ -268,7 +275,27 @@ def motionHandler(evt) {
 	}
 }
 
-private tempCheck(currentTemp, desiredTemp)
+def recentMotion() {
+	state.hasRecentMotion = false
+}
+
+def recentOverride() {
+	state.hasRecentOverride = false
+}
+
+private wasOverride() {
+	def diff = state.lastSwitchLevelSetTime - state.lastAutoLevelSetTime
+	if (diff < 500 && diff > -500) {
+		state.hasRecentOverride = true
+		if (state.debug) log.debug "the last event from the switch and the app were probably the same; the difference was $diff"
+		return false
+	} else {
+		if (state.debug) log.debug "the last event from the switch and the app were probably different; the difference was $diff"
+		return true
+	}
+}
+
+private def tempCheck(currentTemp, desiredTemp)
 {
 	if (state.debug) log.debug "TEMPCHECK#1(CT=$currentTemp,SP=$desiredTemp,FD=$fanDimmer.currentSwitch,FD_LVL=$fanDimmer.currentLevel, automode=$autoMode,FDTstring=$fanDiffTempString, FDTvalue=$fanDiffTempValue)"
 		
@@ -281,80 +308,88 @@ private tempCheck(currentTemp, desiredTemp)
 	def LowDiff = fanDiffTempValue*1 
 	def MedDiff = fanDiffTempValue*2
 	def HighDiff = fanDiffTempValue*3
-	def auto = okToAutoAdjust()
 	
-	if (state.debug) log.debug "TEMPCHECK#2(CT=$currentTemp,SP=$desiredTemp,FD=$fanDimmer.currentSwitch,FD_LVL=$fanDimmer.currentLevel, automode=$autoMode,FDTstring=$fanDiffTempString, FDTvalue=$fanDiffTempValue)"
-		if (state.debug) log.debug "okToAutoAdjust: $auto"
-	if (autoModeValue == "YES-Auto" && okToAutoAdjust()) {
+	if (autoModeValue == "YES-Auto" && !state.hasRecentOverride) {
+		def currentLevel = fanDimmer.currentLevel
 		switch (currentTemp - desiredTemp) {
-			case { it  >= HighDiff }:
-				// turn on fan high speed
-				fanDimmer.setLevel(90) 
-				if (state.debug) log.debug "HI speed(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, HighDiff=$HighDiff)"
+			case { it >= HighDiff }:
+				if (shouldAutoAdjust("high")) {
+					// turn on fan high speed
+					fanDimmer.setLevel(90)
+					state.lastAutoLevelSetTime = now()
+					if (state.debug) log.debug "HI speed(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, HighDiff=$HighDiff)"
+				}
 				break  //exit switch statement 
 			case { it >= MedDiff }:
+				if (shouldAutoAdjust("medium"))
 				// turn on fan medium speed
 				fanDimmer.setLevel(60)
+				state.lastAutoLevelSetTime = now()
 				if (state.debug) log.debug "MED speed(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, MedDiff=$MedDiff)"
 				break
 			case { it >= LowDiff }:
-				// turn on fan low speed
-				if (fanDimmer.currentSwitch == "off") {   // if fan is OFF to make it easier on motor by   
-					fanDimmer.setLevel(90)          // starting fan in High speed temporarily then 
-					fanDimmer.setLevel(30, [delay: 1000]) // change to Low speed after 1 second
-					if (state.debug) log.debug "LO speed after HI 3secs(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, LowDiff=$LowDiff)"
-				} else {
-					fanDimmer.setLevel(30)  //fan is already running, not necessary to protect motor
-				}             //set Low speed immediately
-				if (state.debug) log.debug "LO speed immediately(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, LowDiff=$LowDiff)"
+				if (shouldAutoAdjust("low")) {
+					// turn on fan low speed
+					if (fanDimmer.currentSwitch == "off") {   // if fan is OFF to make it easier on motor by   
+						fanDimmer.setLevel(90) // starting fan in High speed temporarily then
+						fanDimmer.setLevel(30, [delay: 1000]) // change to Low speed after 1 second
+						if (state.debug) log.debug "LO speed after HI 3secs(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, LowDiff=$LowDiff)"
+					} else {
+						fanDimmer.setLevel(30)  //fan is already running, not necessary to protect motor
+					}             //set Low speed immediately
+					state.lastAutoLevelSetTime = now()
+					if (state.debug) log.debug "LO speed immediately(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, LowDiff=$LowDiff)"
+				}
 				break
 			default:
 				// check to see if fan should be turned off
-				if (desiredTemp - currentTemp >= 0 ) {  //below or equal to setpoint, turn off fan, zero level
+				if (desiredTemp - currentTemp >= 0 && shouldAutoAdjust("off")) {  //below or equal to setpoint, turn off fan, zero level
 					fanDimmer.off()
+					state.lastAutoLevelSetTime = now()
 					if (state.debug) log.debug "below SP+Diff=fan OFF (CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, FD=$fanDimmer.currentSwitch,autoMode=$autoMode,)"
 				} 
 				if (state.debug) log.debug "autoMode YES-MANUAL? else OFF(CT=$currentTemp, SP=$desiredTemp, FD-LVL=$fanDimmer.currentLevel, FD=$fanDimmer.currentSwitch,autoMode=$autoMode,)"
 		}
-
-		state.lastAutoLevelSetTime = now()
 	} 
 }
 
-private hasBeenRecentMotion()
-{
-	def isActive = false
-	if (motionSensor && minutes) {
-		def deltaMinutes = minutes as Long
-		if (deltaMinutes) {
-			def motionEvents = motionSensor.eventsSince(new Date(now() - (60000 * deltaMinutes)))
-			log.trace "Found ${motionEvents?.size() ?: 0} events in the last $deltaMinutes minutes"
-			if (motionEvents.find { it.value == "active" }) {
-				isActive = true
+private def shouldAutoAdjust(level) {
+	def currentLevel = fanDimmer.currentLevel
+  def currentState = fanDimmer.currentSwitch
+  if (state.debug) log.debug "currentLevel: $currentLevel"
+  if (state.debug) log.debug "currentState: $currentState"
+	switch (level) {
+		case "high":
+			if (currentLevel < 68 || currentState == "off") {
+				return true
+			} else {
+				if (state.debug) log.debug "fan was already on high, no need to send a new setting"
+				return false
 			}
-		}
-	}
-	else {
-		isActive = true
-	}
-	isActive
-}
-
-private okToAutoAdjust() {
-	// determine if last autoLevelSetEvent and switch reported event were the same
-	def now = now()
-	def diff1 = state.lastSwitchLevelSetTime - state.lastAutoLevelSetTime
-	def diff2 = (new Date().getTime()) - state.lastSwitchLevelSetTime
-	if (state.debug) log.debug "lastSwitchLevelSetTime: $state.lastSwitchLevelSetTime \nlastAutoLevelSetTime: $state.lastAutoLevelSetTime \nnow: $now \ndiff1: $diff1 \ndiff2: $diff2"
-	if ((state.lastSwitchLevelSetTime - state.lastAutoLevelSetTime) < 500) { // if true, they were the same event
-		if (state.debug) log.debug "the last event from the switch and the app were probably the same; the difference was $diff1"
-		return true
-	} else if (((new Date().getTime()) - state.lastSwitchLevelSetTime) > (overrideFromSwitchTime * 60000) ) { // if true, then enough time has passed to allow the app to do it's thing again
-		if (state.debug) log.debug "it's been long enough since the last manual level set, the app can take over again"
-		return true
-	} else {
-		if (state.debug) log.debug "skipping setting the level by app because of probable interaction from another source"
-		return false
+			break
+		case "medium":
+			if (currentLevel < 34 || currentLevel > 67 || currentState == "off") {
+				return true
+			} else {
+				if (state.debug) log.debug "fan was already on medium, no need to send a new setting"
+				return false
+			}
+			break
+		case "low":
+			if (currentLevel > 33 || currentState == "off") {
+				return true
+			} else {
+				if (state.debug) log.debug "fan was already on low, no need to send a new setting"
+				return false
+			}
+			break
+		default:
+			if (currentState == "off") {
+				if (state.debug) log.debug "fan was already off, no need to send a new setting"
+				return false
+			} else {
+				return true
+			}
 	}
 }
 
