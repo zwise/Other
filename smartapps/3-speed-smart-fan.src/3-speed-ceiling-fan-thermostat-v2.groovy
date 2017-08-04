@@ -135,7 +135,7 @@ def childStartPage() {
 					page: "aboutPage"
 				)
 			}
-		
+		}
 	}
 }      
 
